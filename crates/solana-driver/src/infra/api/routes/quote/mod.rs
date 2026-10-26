@@ -23,7 +23,8 @@ use {
 };
 
 /// Handle `POST /quote`: solve a one-order auction and answer with the
-/// executed amounts and the network fee of settling them.
+/// executed amounts of its best settleable route, the network fee of
+/// settling them, and whether the settlement passed simulation.
 pub(crate) async fn quote(
     state: axum::extract::State<State>,
     LoggingJson(request): LoggingJson<dto::QuoteRequest>,
@@ -39,36 +40,26 @@ pub(crate) async fn quote(
 
     let competition = state.competition();
     let span = tracing::info_span!("/quote", solver = %competition.solver_name());
-    let solutions = competition
-        .compute_solutions(&auction, None)
-        .instrument(span.clone())
-        .await?;
-
-    // A solution fills one order, so the best quote is the trade that gives the
-    // most: the largest buy for a sell order, the smallest sell for a buy
-    // order.
-    let quoted = solutions
-        .iter()
-        .filter_map(|solution| Some((solution, solution.trades.first()?)));
-    let best = match side {
-        auction::Side::Sell => quoted.max_by_key(|(_, trade)| trade.executed_buy),
-        auction::Side::Buy => quoted.min_by_key(|(_, trade)| trade.executed_sell),
-    };
-    let Some((solution, trade)) = best else {
+    let Some(quote) = competition.quote(auction).instrument(span.clone()).await? else {
         return Err(Kind::QuotingFailed.into());
     };
-    let network_fee = competition.network_fee(solution).instrument(span).await?;
+    let network_fee = competition
+        .network_fee(&quote.solution)
+        .instrument(span)
+        .await?;
 
     Ok(Json(dto::QuoteResponse {
-        sell_amount: trade.executed_sell,
-        buy_amount: trade.executed_buy,
-        solver: solution.solver,
+        sell_amount: quote.trade.executed_sell,
+        buy_amount: quote.trade.executed_buy,
+        solver: quote.solution.solver,
         network_fee,
+        verified: quote.verified,
     }))
 }
 
 /// The single-order auction a quote is solved in. Everything beyond the pair
-/// and the amount is a placeholder: a quoted solution is never settled.
+/// and the amount is a placeholder: the verification settles an order of the
+/// executed amounts in its place, see `domain::quote`.
 fn quote_auction(request: &dto::QuoteRequest, side: auction::Side) -> Auction {
     let (sell_amount, buy_amount) = match side {
         // The counter amount is the quote's answer, so its limit stays

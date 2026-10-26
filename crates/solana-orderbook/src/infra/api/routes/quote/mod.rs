@@ -182,16 +182,17 @@ pub async fn quote(
         from: request.from,
         expiration,
         id,
-        verified: false,
+        verified: quoted.verified,
         funder: state.sponsoring().map(|sponsoring| sponsoring.funder),
     }))
 }
 
 /// The best of `quotes` once each has its execution cost taken out: the
-/// largest buy for a sell order, the smallest sell for a buy order. Returned
-/// with the cost it absorbed. `rent` is the buy token account's, `price` the
-/// native price of the token the cost comes out of. `None` when no quote can
-/// absorb its cost.
+/// largest buy for a sell order, the smallest sell for a buy order, a
+/// verified quote ahead of any unverified one whatever its amount, as the
+/// EVM orderbook prefers verified quotes. Returned with the cost it absorbed.
+/// `rent` is the buy token account's, `price` the native price of the token
+/// the cost comes out of. `None` when no quote can absorb its cost.
 fn best(
     quotes: Vec<quoter::Quote>,
     kind: dto::Kind,
@@ -202,8 +203,8 @@ fn best(
         .into_iter()
         .filter_map(|quote| net(quote, kind, rent, price));
     match kind {
-        dto::Kind::Sell => netted.max_by_key(|(quote, _)| quote.buy_amount),
-        dto::Kind::Buy => netted.min_by_key(|(quote, _)| quote.sell_amount),
+        dto::Kind::Sell => netted.max_by_key(|(quote, _)| (quote.verified, quote.buy_amount)),
+        dto::Kind::Buy => netted.min_by_key(|(quote, _)| (!quote.verified, quote.sell_amount)),
     }
 }
 
@@ -610,6 +611,7 @@ mod tests {
             buy_amount,
             solver: Pubkey::default(),
             network_fee,
+            verified: false,
             driver: String::new(),
         }
     }
@@ -704,6 +706,31 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// A verified quote beats a better unverified one on either side, and
+    /// the best verified quote wins among verified ones.
+    #[test]
+    fn a_verified_quote_outranks_a_better_unverified_one() {
+        let lamport_an_atom = price(Solana::NATIVE_PRICE_DENOMINATOR);
+        let verified = |sell_amount, buy_amount| quoter::Quote {
+            verified: true,
+            ..quote(sell_amount, buy_amount, 0)
+        };
+        let quotes = vec![
+            quote(1_000, 5_000, 0),
+            verified(1_000, 4_000),
+            verified(1_000, 4_500),
+        ];
+        let (sell, _) = best(quotes, dto::Kind::Sell, 0, lamport_an_atom).unwrap();
+        assert_eq!((sell.buy_amount, sell.verified), (4_500, true));
+        let quotes = vec![
+            quote(1_000, 5_000, 0),
+            verified(1_200, 5_000),
+            verified(1_100, 5_000),
+        ];
+        let (buy, _) = best(quotes, dto::Kind::Buy, 0, lamport_an_atom).unwrap();
+        assert_eq!((buy.sell_amount, buy.verified), (1_100, true));
     }
 
     #[test]

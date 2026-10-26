@@ -8,6 +8,7 @@ use {
     cow_settlement_interface::token_program::TokenProgram,
     solana_sdk::{
         account::{Account, from_account},
+        program_pack::Pack,
         pubkey::Pubkey,
         rent::Rent,
         sysvar,
@@ -16,7 +17,7 @@ use {
     solana_token::ata_len,
     spl_token_2022_interface::{
         extension::StateWithExtensions,
-        state::{Account as TokenAccount, AccountState, Mint},
+        state::{Account as TokenAccount, AccountState, Mint, Multisig},
     },
     std::collections::HashMap,
 };
@@ -64,10 +65,30 @@ impl AccountsSnapshot {
             .ok_or(InvalidMintReason::AccountNotFound)?;
         let program =
             TokenProgram::try_from(&account.owner).map_err(|_| InvalidMintReason::NotAMint)?;
-        StateWithExtensions::<Mint>::unpack(&account.data)
+        let mint = StateWithExtensions::<Mint>::unpack(&account.data)
             .map_err(|_| InvalidMintReason::NotAMint)?;
         let ata_len = ata_len(account).ok_or(InvalidMintReason::NotAMint)?;
-        Ok(MintInfo { program, ata_len })
+        Ok(MintInfo {
+            program,
+            ata_len,
+            mint_authority: mint.base.mint_authority.into(),
+        })
+    }
+
+    /// The signers a token program multisig at `address` requires, its
+    /// threshold's worth of its signer set. `None` when no initialized
+    /// multisig of either token program is there.
+    pub fn multisig_signers(&self, address: &Pubkey) -> Option<Vec<Pubkey>> {
+        let account = self.accounts.get(address)?;
+        TokenProgram::try_from(&account.owner).ok()?;
+        let multisig = Multisig::unpack(&account.data).ok()?;
+        Some(
+            multisig.signers[..usize::from(multisig.n)]
+                .iter()
+                .take(usize::from(multisig.m))
+                .copied()
+                .collect(),
+        )
     }
 
     /// Classify the state of the token account at `address` for a caller that
@@ -126,6 +147,8 @@ pub struct MintInfo {
     pub program: TokenProgram,
     /// The data length of a new associated token account of the mint.
     pub ata_len: usize,
+    /// The authority that can mint more of it, `None` once revoked.
+    pub mint_authority: Option<Pubkey>,
 }
 
 /// The observed state of a token account, for a caller that creates missing
@@ -161,13 +184,16 @@ pub enum InvalidMintReason {
 mod tests {
     use {
         super::*,
-        solana_sdk::program_pack::Pack,
-        spl_token_2022_interface::extension::{
-            BaseStateWithExtensionsMut,
-            ExtensionType,
-            StateWithExtensionsMut,
-            immutable_owner::ImmutableOwner,
-            mint_close_authority::MintCloseAuthority,
+        solana_sdk::program_option::COption,
+        spl_token_2022_interface::{
+            extension::{
+                BaseStateWithExtensionsMut,
+                ExtensionType,
+                StateWithExtensionsMut,
+                immutable_owner::ImmutableOwner,
+                mint_close_authority::MintCloseAuthority,
+            },
+            instruction::MAX_SIGNERS,
         },
         spl_token_interface::ID as SPL_TOKEN_PROGRAM_ID,
     };
@@ -390,6 +416,7 @@ mod tests {
             Ok(MintInfo {
                 program: TokenProgram::SplToken,
                 ata_len: TokenAccount::LEN,
+                mint_authority: None,
             })
         );
         assert_eq!(
@@ -400,8 +427,75 @@ mod tests {
                     ExtensionType::ImmutableOwner,
                 ])
                 .unwrap(),
+                mint_authority: None,
             })
         );
+    }
+
+    /// A mint reads as its authority, and a revoked one as none.
+    #[test]
+    fn a_mint_reads_as_its_authority() {
+        let (minted, revoked, authority) = (pubkey(0x11), pubkey(0x12), pubkey(0x13));
+        let mut data = vec![0; Mint::LEN];
+        Mint {
+            mint_authority: COption::Some(authority),
+            is_initialized: true,
+            decimals: 6,
+            ..Mint::default()
+        }
+        .pack_into_slice(&mut data);
+        let minted_account = Account {
+            data,
+            ..mint_account()
+        };
+        let snapshot = snapshot([(minted, minted_account), (revoked, mint_account())]);
+        assert_eq!(
+            snapshot.mint_info(&minted).unwrap().mint_authority,
+            Some(authority)
+        );
+        assert_eq!(snapshot.mint_info(&revoked).unwrap().mint_authority, None);
+    }
+
+    /// A 2-of-3 multisig lists its first two signers, the mint account next to
+    /// it, a plain account and a missing one list none.
+    #[test]
+    fn a_multisig_lists_its_thresholds_worth_of_signers() {
+        let (multisig, mint, plain) = (pubkey(0x11), pubkey(0x12), pubkey(0x13));
+        let signers = [pubkey(0x21), pubkey(0x22), pubkey(0x23)];
+        let mut data = vec![0; Multisig::LEN];
+        let mut state = Multisig {
+            m: 2,
+            n: 3,
+            is_initialized: true,
+            signers: [Pubkey::default(); MAX_SIGNERS],
+        };
+        state.signers[..3].copy_from_slice(&signers);
+        state.pack_into_slice(&mut data);
+        let snapshot = snapshot([
+            (
+                multisig,
+                Account {
+                    owner: SPL_TOKEN_PROGRAM_ID,
+                    data,
+                    ..Account::default()
+                },
+            ),
+            (mint, mint_account()),
+            (
+                plain,
+                Account {
+                    lamports: 1,
+                    ..Account::default()
+                },
+            ),
+        ]);
+        assert_eq!(
+            snapshot.multisig_signers(&multisig),
+            Some(signers[..2].to_vec())
+        );
+        assert_eq!(snapshot.multisig_signers(&mint), None);
+        assert_eq!(snapshot.multisig_signers(&plain), None);
+        assert_eq!(snapshot.multisig_signers(&pubkey(0x14)), None);
     }
 
     /// The rent sysvar is read when fetched and taken from the SDK otherwise.

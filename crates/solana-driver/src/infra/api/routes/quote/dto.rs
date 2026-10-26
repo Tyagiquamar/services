@@ -42,4 +42,7 @@ pub struct QuoteResponse {
     /// are not reduced by it.
     #[serde_as(as = "DisplayFromStr")]
     pub network_fee: u64,
+    /// Whether the settlement of the quoted route passed simulation, funded
+    /// as the quoted order would be.
+    pub verified: bool,
 }

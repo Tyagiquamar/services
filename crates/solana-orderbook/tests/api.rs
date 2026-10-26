@@ -409,6 +409,7 @@ async fn quote_answers_in_the_evm_shape() {
         "buyAmount": "3461207",
         "solver": "9VXC6LH9eXMBpXLQnxMYAGkjs59Zon2ACciJwQ6iMzNB",
         "networkFee": "6400",
+        "verified": true,
     }))
     .await;
     let addr = spawn_server_with(Quoter::new(
@@ -462,7 +463,7 @@ async fn quote_answers_in_the_evm_shape() {
             "from": body["from"],
             "expiration": json["expiration"],
             "id": null,
-            "verified": false,
+            "verified": true,
             "funder": null,
         })
     );
@@ -660,6 +661,44 @@ async fn quote_picks_the_best_driver_answer() {
     let json: serde_json::Value = response.json().await.unwrap();
     assert_eq!(json["quote"]["buyAmount"], "2779760");
     assert_eq!(json["quote"]["costs"]["networkFees"], "0");
+}
+
+/// A driver's verified answer wins over a better unverified one, and a
+/// driver that does not report verification counts as unverified.
+#[tokio::test]
+async fn quote_prefers_a_verified_driver_answer() {
+    let unverified = spawn_mock_driver(serde_json::json!({
+        "sellAmount": "10000000",
+        "buyAmount": "5000000",
+        "solver": "9VXC6LH9eXMBpXLQnxMYAGkjs59Zon2ACciJwQ6iMzNB",
+    }))
+    .await;
+    let verified = spawn_mock_driver(serde_json::json!({
+        "sellAmount": "10000000",
+        "buyAmount": "4000000",
+        "solver": "9VXC6LH9eXMBpXLQnxMYAGkjs59Zon2ACciJwQ6iMzNB",
+        "verified": true,
+    }))
+    .await;
+    let addr = spawn_server_with(Quoter::new(
+        vec![
+            format!("http://{unverified}/").parse().unwrap(),
+            format!("http://{verified}/").parse().unwrap(),
+        ],
+        Duration::from_secs(1),
+    ))
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/api/v1/quote"))
+        .json(&quote_body(serde_json::json!({"validFor": 1800})))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let json: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(json["quote"]["buyAmount"], "1779760");
+    assert_eq!(json["verified"], true);
 }
 
 /// A buy order keeps its buy amount and pulls the execution cost, priced in

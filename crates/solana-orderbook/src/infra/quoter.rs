@@ -51,6 +51,8 @@ pub struct Quote {
     /// The network fee of settling the quoted route, in lamports. Zero when
     /// the driver reports none.
     pub network_fee: u64,
+    /// Whether the driver confirmed the amounts by simulating the settlement.
+    pub verified: bool,
     /// The driver that answered, as labelled in metrics.
     pub driver: String,
 }
@@ -103,6 +105,9 @@ struct ResponseBody {
     #[serde_as(as = "Option<DisplayFromStr>")]
     #[serde(default)]
     network_fee: Option<u64>,
+    /// Unverified from a driver that does not report it.
+    #[serde(default)]
+    verified: bool,
 }
 
 #[derive(Deserialize)]
@@ -162,6 +167,7 @@ impl Quoter {
             buy_amount: quoted.buy_amount,
             solver: quoted.solver,
             network_fee: quoted.network_fee.unwrap_or(0),
+            verified: quoted.verified,
             driver,
         })
     }

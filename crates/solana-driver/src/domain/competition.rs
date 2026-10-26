@@ -11,12 +11,13 @@ use {
         order_uid::OrderUid,
         priority_fee::{self, PriorityFeePolicy},
         program_error::ProgramError,
+        quote::{self, Funding},
         settlement::{self, ResolveError, writable_accounts},
         slot::Slot,
-        solution::Solution,
+        solution::{Solution, Trade},
     },
     crate::infra::{
-        blockchain::{BundleSimulation, Solana},
+        blockchain::{BundleSimulation, InvalidMintReason, Solana},
         config::FeeHandler,
         solver::Solver,
     },
@@ -27,9 +28,12 @@ use {
         message::{VersionedMessage, v1},
         pubkey::Pubkey,
         signature::Signature,
+        sysvar,
         transaction::{TransactionError, VersionedTransaction},
     },
+    spl_token_interface::native_mint,
     std::{
+        cmp::Reverse,
         collections::HashMap,
         sync::Arc,
         time::{Duration, Instant},
@@ -76,7 +80,29 @@ pub(crate) struct Competition {
     /// auction.
     buy_token_accounts: BuyTokenAccountCache,
     priority_fee: PriorityFeePolicy,
+    /// System accounts whose lamports fund a simulated wSOL sell, see
+    /// [`Self::funding`].
+    sol_donors: Vec<Pubkey>,
     solutions: Cache<Key, CachedSolution>,
+}
+
+/// What the engine answered a quote with: its best route that does not
+/// provably fail to settle, and whether its settlement passed simulation.
+pub(crate) struct Quote {
+    pub solution: Solution,
+    pub trade: Trade,
+    pub verified: bool,
+}
+
+/// What verifying a quote found out.
+enum Verdict {
+    /// The settlement passed simulation.
+    Verified,
+    /// The driver could not find out: nothing funds the sell in simulation,
+    /// the funding leg failed, or the simulation was inconclusive.
+    Unverified,
+    /// The settlement provably fails.
+    Failed(Error),
 }
 
 impl Competition {
@@ -85,12 +111,14 @@ impl Competition {
         blockchain: Arc<Solana>,
         buy_token_accounts: BuyTokenAccountCache,
         priority_fee: PriorityFeePolicy,
+        sol_donors: Vec<Pubkey>,
     ) -> Self {
         Self {
             solver,
             blockchain,
             buy_token_accounts,
             priority_fee,
+            sol_donors,
             solutions: Cache::builder().time_to_live(SOLUTION_CACHE_TTL).build(),
         }
     }
@@ -236,7 +264,8 @@ impl Competition {
             .iter()
             .filter_map(|order| Some((order.uid, auction.creations.get(&order.uid).cloned()?)))
             .unzip();
-        let settlement = super::Settlement::new(program_id, auction_id, orders, solution.clone())?;
+        let settlement =
+            super::Settlement::new(program_id, Some(auction_id), orders, solution.clone())?;
         let resolved = settlement
             .resolve_accounts(&self.blockchain, self.solver.pubkey())
             .await?
@@ -244,6 +273,20 @@ impl Competition {
         // The simulation skips signature checks and replaces every blockhash,
         // so an unsigned transaction saves the signing and the fetch.
         bundle.push(resolved.unsigned()?);
+        self.simulate(solution.id, &bundle, &creation_uids).await
+    }
+
+    /// Check each leg of `bundle` fits the network's byte and account lock
+    /// limits, then simulate the bundle. `creations` names the order each
+    /// leading creation leg creates, for the logs. A pass returns the slot
+    /// the bundle simulated against and the compute units its last leg
+    /// consumed.
+    async fn simulate(
+        &self,
+        solution_id: u64,
+        bundle: &[VersionedTransaction],
+        creations: &[OrderUid],
+    ) -> Result<(Slot, Option<u64>), Error> {
         bundle.iter().try_for_each(check_size)?;
         if let Some(accounts) = bundle
             .iter()
@@ -253,36 +296,36 @@ impl Competition {
             return Err(Error::TooManyAccounts { accounts });
         }
         tracing::debug!(
-            solution_id = solution.id,
-            creations = ?creation_uids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            solution_id,
+            creations = ?creations.iter().map(ToString::to_string).collect::<Vec<_>>(),
             bytes = bundle.iter().filter_map(encoded_size).sum::<u64>(),
             "simulating settlement bundle"
         );
 
         let BundleSimulation { slot, results } = self
             .blockchain
-            .simulate_bundle(&bundle)
+            .simulate_bundle(bundle)
             .await
             .map_err(Error::Rpc)?;
         for (leg, (transaction, result)) in bundle.iter().zip(&results).enumerate() {
             if let Some(err) = &result.err {
                 // Named here because the bundle endpoint may return no logs
-                // for a failed leg. `solve` warns about the dropped solution.
+                // for a failed leg. The caller warns about the verdict.
                 tracing::debug!(
                     solver = %self.solver.name(),
-                    solution_id = solution.id,
+                    solution_id,
                     leg,
-                    creation = ?creation_uids.get(leg).map(ToString::to_string),
+                    creation = ?creations.get(leg).map(ToString::to_string),
                     program = ?failing_program(transaction, &err.clone().into()).map(|program| program.to_string()),
                     logs = ?result.logs,
                     slot = %slot,
                     "bundle simulation failed"
                 );
                 return Err(Error::SimulationFailed {
-                    program_error: result
-                        .logs
-                        .as_deref()
-                        .and_then(|logs| ProgramError::from_logs(program_id, logs)),
+                    leg,
+                    program_error: result.logs.as_deref().and_then(|logs| {
+                        ProgramError::from_logs(self.blockchain.program_id(), logs)
+                    }),
                     err: err.clone(),
                 });
             }
@@ -297,6 +340,230 @@ impl Competition {
             slot,
             results.last().and_then(|result| result.units_consumed),
         ))
+    }
+
+    /// Quote the auction's one order: the engine's best route whose
+    /// settlement does not provably fail, verified when it passed simulation.
+    /// `None` when no route is left. The engine gets its share of the
+    /// deadline, as in [`Self::solve`], and the verification the rest.
+    pub async fn quote(&self, mut auction: Auction) -> Result<Option<Quote>, Error> {
+        let now = chrono::Utc::now();
+        let deadline = auction.deadline;
+        auction.deadline = now + (deadline - now) * SOLVING_SHARE_OF_DEADLINE_PERCENT / 100;
+        let solutions = self.compute_solutions(&auction, None).await?;
+        let Some(order) = auction.orders.first() else {
+            return Ok(None);
+        };
+        // A solution fills one order, so the best quote is the trade that
+        // gives the most: the largest buy for a sell order, the smallest sell
+        // for a buy order.
+        let mut quoted: Vec<(Solution, Trade)> = solutions
+            .into_iter()
+            .filter_map(|solution| {
+                let trade = solution.trades.first()?.clone();
+                Some((solution, trade))
+            })
+            .collect();
+        match order.side {
+            Side::Sell => quoted.sort_by_key(|(_, trade)| Reverse(trade.executed_buy)),
+            Side::Buy => quoted.sort_by_key(|(_, trade)| trade.executed_sell),
+        }
+        for (mut solution, trade) in quoted {
+            let window = deadline
+                .signed_duration_since(chrono::Utc::now())
+                .to_std()
+                .unwrap_or_default();
+            match self.verify_quote(order, &mut solution, window).await {
+                Verdict::Failed(error) => tracing::warn!(
+                    solver = %self.solver.name(),
+                    solution_id = solution.id,
+                    ?error,
+                    "dropping quote, its settlement fails in simulation"
+                ),
+                verdict => {
+                    return Ok(Some(Quote {
+                        solution,
+                        trade,
+                        verified: matches!(verdict, Verdict::Verified),
+                    }));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Settle `solution` in simulation against an order of its executed
+    /// amounts whose sell tokens the creation leg conjures, see [`quote`].
+    /// A pass sets the solution's compute unit estimate from the measured
+    /// units, as a solve-time simulation does. A timeout is no verdict.
+    async fn verify_quote(
+        &self,
+        quoted: &Order,
+        solution: &mut Solution,
+        window: Duration,
+    ) -> Verdict {
+        let started = Instant::now();
+        let simulated = tokio::time::timeout(window, self.simulate_quote(quoted, solution))
+            .await
+            .unwrap_or(Err(Error::SimulationTimedOut));
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let window_ms = window.as_millis() as u64;
+        let (verdict, outcome) = match simulated {
+            Ok(Some((slot, units_consumed))) => {
+                tracing::info!(
+                    solver = %self.solver.name(),
+                    solution_id = solution.id,
+                    slot = %slot,
+                    ?units_consumed,
+                    elapsed_ms,
+                    window_ms,
+                    "quote simulation passed"
+                );
+                if let Some(units) = units_consumed
+                    && solution.cu_estimate.is_none()
+                {
+                    solution.cu_estimate = Some(priority_fee::compute_unit_limit(units));
+                }
+                (Verdict::Verified, "passed")
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    solver = %self.solver.name(),
+                    solution_id = solution.id,
+                    sell_token = %quoted.sell_token,
+                    "quote not verifiable, nothing funds its sell in simulation"
+                );
+                (Verdict::Unverified, "unfundable")
+            }
+            Err(Error::SimulationFailed {
+                leg: 0,
+                err,
+                program_error,
+            }) => {
+                tracing::warn!(
+                    solver = %self.solver.name(),
+                    solution_id = solution.id,
+                    sell_token = %quoted.sell_token,
+                    ?err,
+                    ?program_error,
+                    "quote not verifiable, its funding leg fails in simulation"
+                );
+                (Verdict::Unverified, "funding_failed")
+            }
+            Err(error) if proves_failure(&error) => {
+                let outcome = error_label(&error);
+                (Verdict::Failed(error), outcome)
+            }
+            Err(error) => {
+                tracing::info!(
+                    solver = %self.solver.name(),
+                    solution_id = solution.id,
+                    ?error,
+                    elapsed_ms,
+                    window_ms,
+                    "quote simulation inconclusive"
+                );
+                let outcome = error_label(&error);
+                (Verdict::Unverified, outcome)
+            }
+        };
+        metrics()
+            .quote_simulations
+            .with_label_values(&[outcome, self.solver.name()])
+            .inc();
+        verdict
+    }
+
+    /// Simulate the creation leg and the settlement of `solution`'s fill of
+    /// `quoted`. `None` when nothing funds the sell in simulation.
+    async fn simulate_quote(
+        &self,
+        quoted: &Order,
+        solution: &Solution,
+    ) -> Result<Option<(Slot, Option<u64>)>, Error> {
+        let Some(trade) = solution.trades.first() else {
+            return Ok(None);
+        };
+        let Some(funding) = self.funding(quoted.sell_token, trade.executed_sell).await? else {
+            return Ok(None);
+        };
+        let program_id = self.blockchain.program_id();
+        let payer = self.solver.pubkey();
+        let buy_mint = (!quoted.buys_native_sol()).then_some(quoted.buy_token);
+        let programs = self
+            .blockchain
+            .token_programs([quoted.sell_token].into_iter().chain(buy_mint))
+            .await
+            .map_err(Error::Rpc)?;
+        let program = |mint: Pubkey| {
+            programs
+                .get(&mint)
+                .copied()
+                .unwrap_or(Err(InvalidMintReason::AccountNotFound))
+                .map_err(|reason| ResolveError::InvalidMint { mint, reason })
+        };
+        let sell_program = program(quoted.sell_token)?;
+        let buy_program = buy_mint.map(program).transpose()?;
+        let order = quote::order(&program_id, quoted, trade, sell_program, buy_program)?;
+        let creation = quote::creation_leg(&program_id, &payer, &order, sell_program, &funding)?;
+        // The engine filled the placeholder order, the settlement fills the
+        // simulated one.
+        let mut filled = solution.clone();
+        for trade in &mut filled.trades {
+            trade.order_uid = order.uid;
+        }
+        let settlement = super::Settlement::new(program_id, None, vec![order], filled)?;
+        let resolved = settlement
+            .resolve_accounts(&self.blockchain, payer)
+            .await?
+            .with_max_native_shortfall(self.solver.max_native_shortfall());
+        let bundle = [creation, resolved.unsigned()?];
+        self.simulate(solution.id, &bundle, &[]).await.map(Some)
+    }
+
+    /// How a simulated sell of `amount` of `mint` is funded: the first
+    /// configured donor whose lamports cover a wSOL sell beyond its own rent,
+    /// or the mint authority minting the amount, its multisig's signers
+    /// standing in when it is one. `None` when nothing can: no such donor, or
+    /// a revoked authority.
+    async fn funding(&self, mint: Pubkey, amount: u64) -> Result<Option<Funding>, Error> {
+        if mint == native_mint::ID {
+            if self.sol_donors.is_empty() {
+                return Ok(None);
+            }
+            let snapshot = self
+                .blockchain
+                .accounts_snapshot(self.sol_donors.iter().copied().chain([sysvar::rent::ID]))
+                .await
+                .map_err(Error::Rpc)?;
+            let reserve = snapshot.rent().minimum_balance(0);
+            let donor = self
+                .sol_donors
+                .iter()
+                .copied()
+                .find(|donor| snapshot.lamports(donor).saturating_sub(reserve) >= amount);
+            return Ok(donor.map(|donor| Funding::Lamports { donor }));
+        }
+        let info = self
+            .blockchain
+            .mints([mint])
+            .await
+            .map_err(Error::Rpc)?
+            .remove(&mint)
+            .unwrap_or(Err(InvalidMintReason::AccountNotFound))
+            .map_err(|reason| ResolveError::InvalidMint { mint, reason })?;
+        let Some(authority) = info.mint_authority else {
+            return Ok(None);
+        };
+        let snapshot = self
+            .blockchain
+            .accounts_snapshot([authority])
+            .await
+            .map_err(Error::Rpc)?;
+        Ok(Some(Funding::Mint {
+            authority,
+            signers: snapshot.multisig_signers(&authority).unwrap_or_default(),
+        }))
     }
 
     /// Send the auction to the solver engine and return its deduplicated
@@ -549,7 +816,7 @@ impl Competition {
 
         let volume_fees = solver_volume_fees(&orders, &solution);
 
-        let settlement = super::Settlement::new(program_id, auction_id, orders, solution)?;
+        let settlement = super::Settlement::new(program_id, Some(auction_id), orders, solution)?;
 
         // Land the creations only after the solution validated: an invalid
         // solution must not cost the funder any fees. They get the full
@@ -751,6 +1018,7 @@ impl Competition {
                 "settlement simulation failed"
             );
             return Err(Error::SimulationFailed {
+                leg: 0,
                 program_error: simulation
                     .logs
                     .as_deref()
@@ -866,8 +1134,10 @@ pub(crate) enum Error {
     #[error("failed to submit or confirm an order creation: {0}")]
     FailedToCreate(#[source] cow_solana_rpc::Error),
     /// The pre-submission simulation failed. The transaction was not sent.
-    #[error("settlement simulation failed: {err}, program error {program_error:?}")]
+    /// `leg` is the failing transaction's index in its bundle.
+    #[error("settlement simulation failed at leg {leg}: {err}, program error {program_error:?}")]
     SimulationFailed {
+        leg: usize,
         #[source]
         err: cow_solana_rpc::UiTransactionError,
         program_error: Option<ProgramError>,
@@ -912,6 +1182,9 @@ struct Metrics {
     /// Solve-time settlement simulations by outcome and solver.
     #[metric(labels("outcome", "solver"))]
     solve_simulations: prometheus::IntCounterVec,
+    /// Quote verifications by outcome and solver.
+    #[metric(labels("outcome", "solver"))]
+    quote_simulations: prometheus::IntCounterVec,
     /// Serialized settlement transaction size in bytes. The network rejects a
     /// v1 transaction over 4096 bytes.
     #[metric(buckets(1000., 1500., 2000., 2500., 3000., 3500., 4096.))]

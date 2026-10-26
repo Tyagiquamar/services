@@ -7,6 +7,7 @@ use {
     },
     axum::{Router, extract::DefaultBodyLimit, routing::get},
     observe::tracing::distributed::axum::{make_span, record_trace_id},
+    solana_sdk::pubkey::Pubkey,
     std::{
         net::SocketAddr,
         num::NonZero,
@@ -36,6 +37,9 @@ pub struct Api {
     pub solvers: Vec<Solver>,
     /// The priority fee policy for transactions.
     pub priority_fee: domain::priority_fee::PriorityFeePolicy,
+    /// System accounts whose lamports fund a simulated wSOL sell while a
+    /// quote is verified.
+    pub sol_donors: Vec<Pubkey>,
 }
 
 impl Api {
@@ -76,6 +80,7 @@ impl Api {
                 self.blockchain.clone(),
                 buy_token_accounts.clone(),
                 self.priority_fee,
+                self.sol_donors.clone(),
             );
             let state = State::new(competition, solve_every_nth_auction);
 
