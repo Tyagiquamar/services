@@ -23,8 +23,8 @@ use {
 };
 
 /// Handle `POST /quote`: solve a one-order auction and answer with the
-/// executed amounts of its best settleable route, the network fee of
-/// settling them, and whether the settlement passed simulation.
+/// executed amounts of its best route, the network fee of settling them and,
+/// for a request naming an owner, the settlement itself.
 pub(crate) async fn quote(
     state: axum::extract::State<State>,
     LoggingJson(request): LoggingJson<dto::QuoteRequest>,
@@ -40,26 +40,59 @@ pub(crate) async fn quote(
 
     let competition = state.competition();
     let span = tracing::info_span!("/quote", solver = %competition.solver_name());
-    let Some(quote) = competition.quote(auction).instrument(span.clone()).await? else {
+    let solutions = competition
+        .compute_solutions(&auction, None)
+        .instrument(span.clone())
+        .await?;
+
+    // A solution fills one order, so the best quote is the trade that gives the
+    // most: the largest buy for a sell order, the smallest sell for a buy
+    // order.
+    let quoted = solutions
+        .iter()
+        .filter_map(|solution| Some((solution, solution.trades.first()?)));
+    let best = match side {
+        auction::Side::Sell => quoted.max_by_key(|(_, trade)| trade.executed_buy),
+        auction::Side::Buy => quoted.min_by_key(|(_, trade)| trade.executed_sell),
+    };
+    let Some((solution, trade)) = best else {
         return Err(Kind::QuotingFailed.into());
     };
     let network_fee = competition
-        .network_fee(&quote.solution)
-        .instrument(span)
+        .network_fee(solution)
+        .instrument(span.clone())
         .await?;
+    // A settlement that cannot be built leaves the quote unverifiable, not
+    // unanswered.
+    let transaction = match (request.owner, auction.orders.first()) {
+        (Some(owner), Some(order)) => competition
+            .quote_settlement(order, solution, trade, owner)
+            .instrument(span)
+            .await
+            .inspect_err(|err| {
+                tracing::warn!(
+                    solution_id = solution.id,
+                    ?err,
+                    "quote settlement not built"
+                )
+            })
+            .ok()
+            .and_then(|transaction| bincode::serialize(&transaction).ok()),
+        _ => None,
+    };
 
     Ok(Json(dto::QuoteResponse {
-        sell_amount: quote.trade.executed_sell,
-        buy_amount: quote.trade.executed_buy,
-        solver: quote.solution.solver,
+        sell_amount: trade.executed_sell,
+        buy_amount: trade.executed_buy,
+        solver: solution.solver,
         network_fee,
-        verified: quote.verified,
+        transaction,
     }))
 }
 
 /// The single-order auction a quote is solved in. Everything beyond the pair
-/// and the amount is a placeholder: the verification settles an order of the
-/// executed amounts in its place, see `domain::quote`.
+/// and the amount is a placeholder: the settlement answered fills an order of
+/// the executed amounts in its place, see `domain::quote`.
 fn quote_auction(request: &dto::QuoteRequest, side: auction::Side) -> Auction {
     let (sell_amount, buy_amount) = match side {
         // The counter amount is the quote's answer, so its limit stays

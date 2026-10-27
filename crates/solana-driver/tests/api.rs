@@ -14,7 +14,7 @@ use {
         pda::order::find_order_pda,
         token_program::TokenProgram,
     },
-    cow_solana_rpc::{Mocks, MocksMap, RpcRequest, SIMULATE_BUNDLE, SolanaRPC},
+    cow_solana_rpc::{Mocks, RpcRequest, SIMULATE_BUNDLE, SolanaRPC},
     solana_driver::{
         domain::{priority_fee::PriorityFeePolicy, solver_fee::SolverFee},
         infra::{
@@ -25,15 +25,14 @@ use {
         },
     },
     solana_sdk::{
-        account::Account,
-        program_option::COption,
         program_pack::Pack,
         pubkey::Pubkey,
         rent::Rent,
         signature::Signature,
         transaction::VersionedTransaction,
     },
-    solana_testlib::{account_json, mint_account_json, multiple_accounts_json, temp_keypair},
+    solana_testlib::{mint_account_json, multiple_accounts_json, temp_keypair},
+    solana_token::quote::QuoteOrder,
     spl_token_interface::native_mint,
     std::{
         net::SocketAddr,
@@ -87,27 +86,17 @@ fn buy_token_account() -> Pubkey {
 }
 
 /// A blockchain adapter that already knows the test order's mints as SPL
-/// Token mints nobody can mint, so that the mock RPC's answer to every
-/// account lookup, "absent", only ever reaches the token accounts. `mocks`
-/// answers the other requests.
-async fn blockchain_with(mocks: Mocks) -> Arc<Solana> {
-    blockchain_with_mints(mocks.into(), mint_account_json()).await
-}
-
-/// [`blockchain_with`] with the test order's sell mint read as `sell_mint`,
-/// and `mocks` answering each request from its queue, in order, once the
-/// mints are read.
-async fn blockchain_with_mints(mocks: MocksMap, sell_mint: serde_json::Value) -> Arc<Solana> {
-    let mut queued = MocksMap::from_iter([(
+/// Token mints, so that the mock RPC's answer to every account lookup,
+/// "absent", only ever reaches the token accounts. `mocks` answers the other
+/// requests.
+async fn blockchain_with(mut mocks: Mocks) -> Arc<Solana> {
+    mocks.insert(
         RpcRequest::GetMultipleAccounts,
-        multiple_accounts_json([sell_mint, mint_account_json()]),
-    )]);
-    for (request, answers) in mocks.0 {
-        queued.0.entry(request).or_default().extend(answers);
-    }
+        multiple_accounts_json([mint_account_json(), mint_account_json()]),
+    );
     let blockchain = Solana::new(
-        SolanaRPC::new_mock_with_mocks_map(queued.clone()),
-        SolanaRPC::new_mock_with_mocks_map(queued),
+        SolanaRPC::new_mock_with_mocks(mocks.clone()),
+        SolanaRPC::new_mock_with_mocks(mocks),
         program_id(),
     );
     blockchain
@@ -135,7 +124,6 @@ async fn api_with(solvers: Vec<Solver>, mocks: Mocks) -> Api {
         blockchain: blockchain_with(mocks).await,
         solvers,
         priority_fee: priority_fee(),
-        sol_donors: Vec::new(),
     }
 }
 
@@ -688,7 +676,6 @@ async fn settle_rejects_a_passed_submission_deadline() {
         blockchain: blockchain_with(mocks).await,
         solvers: vec![solver],
         priority_fee: priority_fee(),
-        sol_donors: Vec::new(),
     };
     let (listener, addr) = api.bind().await.unwrap();
     let shutdown = CancellationToken::new();
@@ -903,7 +890,6 @@ async fn quote_returns_the_executed_amounts() {
             "buyAmount": "2000",
             "solver": account.to_string(),
             "networkFee": "19000",
-            "verified": false,
         })
     );
 }
@@ -930,7 +916,6 @@ async fn buy_quote_returns_the_executed_amounts() {
             "buyAmount": "2000",
             "solver": account.to_string(),
             "networkFee": "19000",
-            "verified": false,
         })
     );
 }
@@ -1024,7 +1009,6 @@ async fn sell_quote_reports_the_fee_adjusted_buy_amount() {
             "buyAmount": "1900",
             "solver": account.to_string(),
             "networkFee": "19000",
-            "verified": false,
         })
     );
 }
@@ -1053,7 +1037,6 @@ async fn buy_quote_reports_the_fee_adjusted_sell_amount() {
             "buyAmount": "2000",
             "solver": account.to_string(),
             "networkFee": "19000",
-            "verified": false,
         })
     );
 }
@@ -1125,7 +1108,6 @@ async fn native_sol_buy_quote_is_priced_as_wsol() {
             "buyAmount": "2000",
             "solver": account.to_string(),
             "networkFee": "19000",
-            "verified": false,
         })
     );
 }
@@ -1313,233 +1295,46 @@ async fn solve_keeps_a_solution_whose_bundle_simulation_stops_short() {
     assert_eq!(response_ids(&body), vec![42]);
 }
 
-/// An SPL Token mint `authority` can mint more of, in the JSON shape a
-/// `getMultipleAccounts` mock answers with.
-fn mintable_mint_json(authority: Pubkey) -> serde_json::Value {
-    let mut data = vec![0; spl_token_interface::state::Mint::LEN];
-    spl_token_interface::state::Mint {
-        mint_authority: COption::Some(authority),
-        decimals: 6,
-        is_initialized: true,
-        ..Default::default()
-    }
-    .pack_into_slice(&mut data);
-    account_json(&Account {
-        lamports: 1_461_600,
-        owner: spl_token_interface::ID,
-        data,
-        ..Account::default()
-    })
-}
+/// A request naming an owner is answered with the settlement of that owner's
+/// order of the executed amounts: the solver is its only signer and it
+/// names the order's PDA and sell token account.
+#[tokio::test]
+async fn quote_with_an_owner_answers_the_settlement_transaction() {
+    let engine = spawn_mock_solver_engine(quote_solution("1000")).await;
+    let (solver, account) = solver_with_keypair(engine).await;
+    let addr = spawn_server(vec![solver]).await;
+    let owner = pubkey(0x66);
+    let mut request = quote_request("sell", "1000");
+    request["owner"] = serde_json::json!(owner.to_string());
 
-/// A bundle answer passing both legs, the settlement consuming `units`.
-fn bundle_passes(units: u64) -> serde_json::Value {
-    serde_json::json!({
-        "context": { "slot": 1 },
-        "value": { "transactionResults": [
-            { "err": null, "logs": [] },
-            { "err": null, "logs": [], "unitsConsumed": units },
-        ] },
-    })
-}
-
-/// A bundle answer failing at `leg`, the legs before it passing.
-fn bundle_fails_at(leg: usize) -> serde_json::Value {
-    let mut results = vec![serde_json::json!({ "err": null, "logs": [] }); leg];
-    results.push(serde_json::json!({
-        "err": { "InstructionError": [1, { "Custom": 1 }] },
-        "logs": ["boom"],
-    }));
-    serde_json::json!({
-        "context": { "slot": 1 },
-        "value": { "transactionResults": results },
-    })
-}
-
-/// Engine solutions for the quote order, one per `(id, sell_price)` pair:
-/// each sells 1000 for `sell_price` buy units.
-fn quote_solutions(solutions: &[(u64, &str)]) -> serde_json::Value {
-    let solutions: Vec<serde_json::Value> = solutions
-        .iter()
-        .map(|(id, sell_price)| {
-            let mut solution = quote_solution("1000")["solutions"][0].take();
-            solution["id"] = serde_json::json!(id);
-            solution["prices"][pubkey(0x33).to_string()] = serde_json::json!(sell_price);
-            solution
-        })
-        .collect();
-    serde_json::json!({ "solutions": solutions })
-}
-
-/// Spawn the server over a chain whose test sell mint reads as `sell_mint`,
-/// `mocks` answering in queue order and `sol_donors` funding the simulated
-/// wSOL sells.
-async fn spawn_server_on(
-    solvers: Vec<Solver>,
-    sell_mint: serde_json::Value,
-    mocks: MocksMap,
-    sol_donors: Vec<Pubkey>,
-) -> SocketAddr {
-    let api = Api {
-        addr: "0.0.0.0:0".parse().unwrap(),
-        blockchain: blockchain_with_mints(mocks, sell_mint).await,
-        solvers,
-        priority_fee: priority_fee(),
-        sol_donors,
-    };
-    let (listener, addr) = api.bind().await.unwrap();
-    let shutdown = CancellationToken::new();
-    tokio::spawn(async move { api.serve(listener, shutdown).await.unwrap() });
-    addr
-}
-
-/// Post a `/quote` and return the HTTP status and the parsed body.
-async fn call_quote(
-    addr: SocketAddr,
-    body: serde_json::Value,
-) -> (reqwest::StatusCode, serde_json::Value) {
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/mock/quote"))
-        .json(&body)
+        .json(&request)
         .send()
         .await
         .unwrap();
-    let status = response.status();
-    (status, response.json().await.unwrap())
-}
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
 
-/// The sell mint's authority mints the sell amount in the creation leg, so
-/// the bundle passes and the quote is verified, its fee priced at the
-/// measured 100_000 units: twice that at 10_000 micro-lamports is 2_000
-/// lamports, plus the 5_000 lamport signature fee.
-#[tokio::test]
-async fn quote_verified_by_a_passing_bundle_simulation() {
-    let engine = spawn_mock_solver_engine(quote_solution("1000")).await;
-    let (solver, account) = solver_with_keypair(engine).await;
-    let mocks = MocksMap::from_iter([(SIMULATE_BUNDLE, bundle_passes(100_000))]);
-    let addr = spawn_server_on(
-        vec![solver],
-        mintable_mint_json(pubkey(0x77)),
-        mocks,
-        Vec::new(),
-    )
-    .await;
-
-    let (status, json) = call_quote(addr, quote_request("sell", "1000")).await;
-    assert_eq!(status, reqwest::StatusCode::OK);
-    assert_eq!(
-        json,
-        serde_json::json!({
-            "sellAmount": "1000",
-            "buyAmount": "2000",
-            "solver": account.to_string(),
-            "networkFee": "7000",
-            "verified": true,
-        })
-    );
-}
-
-/// Nothing funds a mint nobody can mint, so no bundle is simulated: the
-/// quote stays unverified and its fee at the ceiling, although the mock
-/// bundle would have passed.
-#[tokio::test]
-async fn quote_with_a_revoked_mint_authority_is_unverified() {
-    let engine = spawn_mock_solver_engine(quote_solution("1000")).await;
-    let (solver, _) = solver_with_keypair(engine).await;
-    let mocks = MocksMap::from_iter([(SIMULATE_BUNDLE, bundle_passes(100_000))]);
-    let addr = spawn_server_on(vec![solver], mint_account_json(), mocks, Vec::new()).await;
-
-    let (status, json) = call_quote(addr, quote_request("sell", "1000")).await;
-    assert_eq!(status, reqwest::StatusCode::OK);
-    assert_eq!(json["verified"], false);
-    assert_eq!(json["networkFee"], "19000");
-}
-
-/// A failing creation leg is the driver's fabrication failing, not the
-/// route: the quote stands, unverified.
-#[tokio::test]
-async fn quote_whose_funding_leg_fails_is_unverified() {
-    let engine = spawn_mock_solver_engine(quote_solution("1000")).await;
-    let (solver, _) = solver_with_keypair(engine).await;
-    let mocks = MocksMap::from_iter([(SIMULATE_BUNDLE, bundle_fails_at(0))]);
-    let addr = spawn_server_on(
-        vec![solver],
-        mintable_mint_json(pubkey(0x77)),
-        mocks,
-        Vec::new(),
-    )
-    .await;
-
-    let (status, json) = call_quote(addr, quote_request("sell", "1000")).await;
-    assert_eq!(status, reqwest::StatusCode::OK);
+    let json: serde_json::Value = response.json().await.unwrap();
     assert_eq!(json["buyAmount"], "2000");
-    assert_eq!(json["verified"], false);
-}
-
-/// The better route fails to settle in simulation, so the quote is the next
-/// one, verified. With every route failing there is no quote.
-#[tokio::test]
-async fn quote_falls_back_to_the_next_route_when_the_settlement_leg_fails() {
-    let engine = spawn_mock_solver_engine(quote_solutions(&[(1, "1500"), (2, "2000")])).await;
-    let (solver, _) = solver_with_keypair(engine).await;
-    let mocks = MocksMap::from_iter([
-        (SIMULATE_BUNDLE, bundle_fails_at(1)),
-        (SIMULATE_BUNDLE, bundle_passes(100_000)),
-        (SIMULATE_BUNDLE, bundle_fails_at(1)),
-        (SIMULATE_BUNDLE, bundle_fails_at(1)),
-    ]);
-    let addr = spawn_server_on(
-        vec![solver],
-        mintable_mint_json(pubkey(0x77)),
-        mocks,
-        Vec::new(),
-    )
-    .await;
-
-    let (status, json) = call_quote(addr, quote_request("sell", "1000")).await;
-    assert_eq!(status, reqwest::StatusCode::OK);
-    assert_eq!(json["buyAmount"], "1500");
-    assert_eq!(json["verified"], true);
-
-    let (status, json) = call_quote(addr, quote_request("sell", "1000")).await;
-    assert_eq!(status, reqwest::StatusCode::BAD_REQUEST);
-    assert_eq!(json["kind"], "QuotingFailed");
-}
-
-/// A wSOL sell is funded by the first configured donor whose lamports cover
-/// the amount beyond the donor's own rent, and goes unverified without one.
-#[tokio::test]
-async fn quote_selling_wsol_is_funded_by_a_donor() {
-    for (lamports, verified) in [(10_000_000_000u64, true), (1_000, false)] {
-        let mut solution = quote_solution("1000");
-        let prices = solution["solutions"][0]["prices"].as_object_mut().unwrap();
-        let sell_price = prices.remove(&pubkey(0x33).to_string()).unwrap();
-        prices.insert(native_mint::ID.to_string(), sell_price);
-        let engine = spawn_mock_solver_engine(solution).await;
-        let (solver, _) = solver_with_keypair(engine).await;
-        let donor = Account {
-            lamports,
-            ..Account::default()
-        };
-        let mocks = MocksMap::from_iter([
-            // The donor and the rent sysvar, then the wSOL mint.
-            (
-                RpcRequest::GetMultipleAccounts,
-                multiple_accounts_json([account_json(&donor), serde_json::Value::Null]),
-            ),
-            (
-                RpcRequest::GetMultipleAccounts,
-                multiple_accounts_json([mint_account_json()]),
-            ),
-            (SIMULATE_BUNDLE, bundle_passes(100_000)),
-        ]);
-        let addr =
-            spawn_server_on(vec![solver], mint_account_json(), mocks, vec![pubkey(0x66)]).await;
-
-        let mut body = quote_request("sell", "1000");
-        body["sellToken"] = serde_json::json!(native_mint::ID.to_string());
-        let (status, json) = call_quote(addr, body).await;
-        assert_eq!(status, reqwest::StatusCode::OK);
-        assert_eq!(json["verified"], verified, "donor holding {lamports}");
-    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(json["transaction"].as_str().unwrap())
+        .unwrap();
+    let transaction: VersionedTransaction = bincode::deserialize(&bytes).unwrap();
+    let keys = transaction.message.static_account_keys();
+    assert_eq!(transaction.message.header().num_required_signatures, 1);
+    assert_eq!(keys[0], account);
+    let order = QuoteOrder {
+        owner,
+        sell_mint: pubkey(0x33),
+        sell_program: TokenProgram::SplToken,
+        buy_mint: pubkey(0x44),
+        buy_program: Some(TokenProgram::SplToken),
+        sell_amount: 1_000,
+        buy_amount: 2_000,
+        kind: OrderKind::Sell,
+    };
+    let pda = find_order_pda(&program_id(), &order.intent().unwrap().uid()).0;
+    assert!(keys.contains(&pda));
+    assert!(keys.contains(&order.sell_token_account()));
 }

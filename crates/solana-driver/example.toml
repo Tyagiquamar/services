@@ -28,13 +28,6 @@ max-priority-fee-lamports = 1000000
 # (quotes, and solutions before their simulation), 1..=1400000.
 default-compute-unit-limit = 400000
 
-[quote-verification]
-# Optional. System accounts whose lamports fund a simulated wSOL sell while a
-# quote is verified, the first one holding the amount. The simulation checks
-# no signature, so any large holder serves. Without any, quotes selling wSOL
-# go unverified.
-sol-donors = ["5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9"]
-
 [http]
 bind-address = "0.0.0.0:8080"
 # Port the metrics and probes server binds to, on every interface. Optional;

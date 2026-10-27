@@ -13,7 +13,6 @@ use {
         deserialize_solana_pubkey_b58,
         deserialize_url_with_trailing_slash,
     },
-    serde_with::{DisplayFromStr, serde_as},
     solana_sdk::pubkey::Pubkey,
     std::{net::SocketAddr, num::NonZero, path::Path, time::Duration},
     tokio::fs,
@@ -66,9 +65,6 @@ pub struct Config {
     /// The priority fee policy for transactions.
     #[serde(default)]
     pub priority_fee: PriorityFeePolicy,
-    /// What the simulation verifying a quote may draw on.
-    #[serde(default)]
-    pub quote_verification: QuoteVerification,
     /// HTTP API server configuration.
     pub http: Http,
     /// Logging configuration.
@@ -125,19 +121,6 @@ pub struct Rpc {
     /// Timeout for individual RPC requests.
     #[serde(with = "humantime_serde")]
     pub request_timeout: Duration,
-}
-
-/// What the simulation verifying a quote may draw on.
-#[serde_as]
-#[derive(Debug, Default, Deserialize)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
-pub struct QuoteVerification {
-    /// System accounts whose lamports fund a simulated wSOL sell, the first
-    /// one holding the amount. The simulation checks no signature, so any
-    /// large holder serves. Absent, wSOL sells go unverified.
-    #[serde_as(as = "Vec<DisplayFromStr>")]
-    #[serde(default)]
-    pub sol_donors: Vec<Pubkey>,
 }
 
 /// HTTP API server configuration.
@@ -232,18 +215,6 @@ mod tests {
         assert_eq!(config.logging.stderr_threshold, None);
         assert!(!config.logging.use_json);
         assert_eq!(config.priority_fee, PriorityFeePolicy::default());
-        assert_eq!(
-            config.quote_verification.sol_donors,
-            vec![Pubkey::from_str_const(
-                "5tzFkiKscXHK5ZXCGbXZxdw7gTjjD1mBwuoFbhUvuAi9"
-            )]
-        );
-    }
-
-    #[test]
-    fn quote_verification_defaults_to_no_donors() {
-        let config: QuoteVerification = toml::de::from_str("").unwrap();
-        assert!(config.sol_donors.is_empty());
     }
 
     #[test]

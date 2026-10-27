@@ -74,7 +74,6 @@ pub async fn run(args: Args) {
         blockchain,
         solvers,
         priority_fee: config.priority_fee,
-        sol_donors: config.quote_verification.sol_donors,
     };
     let (listener, _addr) = api.bind().await.expect("failed to bind HTTP server");
     let serve = api.serve(listener, shutdown_token.clone());

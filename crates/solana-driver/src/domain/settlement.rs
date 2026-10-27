@@ -823,7 +823,7 @@ fn transfer_checked(program: TokenProgram) -> bool {
 
 /// The settlement state PDA of `program_id` and its bump: the delegate of every
 /// user token account and the buffers' SPL authority.
-pub(crate) fn find_state_pda(program_id: &Pubkey) -> (Pubkey, u8) {
+fn find_state_pda(program_id: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&STATE_PDA_SEEDS, program_id)
 }
 
